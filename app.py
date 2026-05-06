@@ -1,4 +1,4 @@
-from flask import Flask, request, render_template_string, jsonify, Response
+from flask import Flask, request, render_template_string, jsonify, Response, session
 import requests
 import time
 import threading
@@ -6,8 +6,10 @@ import uuid
 import datetime
 from collections import deque
 import json
+from functools import wraps
 
 app = Flask(__name__)
+app.secret_key = 'your-secret-key-here-change-in-production'  # Required for session
 
 # Global task storage: task_id -> task_info dict
 tasks = {}
@@ -34,25 +36,40 @@ def add_log(task_id, level, message):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_entry = {
         'timestamp': timestamp,
-        'level': level,  # INFO, SUCCESS, ERROR
+        'level': level,
         'message': message
     }
     if task_id not in task_logs:
-        task_logs[task_id] = deque(maxlen=500)  # keep last 500 logs
+        task_logs[task_id] = deque(maxlen=500)
     task_logs[task_id].append(log_entry)
 
-def stop_task(task_id):
-    """Stop a running task safely."""
-    if task_id in tasks:
-        task_info = tasks[task_id]
-        task_info['stop_flag'] = True
-        add_log(task_id, 'INFO', f"Stopping task {task_id}...")
-        return True
-    return False
+def stop_task(task_id, requester_id):
+    """
+    Stop a running task safely with ownership check.
+    Returns: (success, message, http_status_code)
+    """
+    # Check if task exists
+    if task_id not in tasks:
+        return False, f"Task {task_id} not found", 404
+    
+    task_info = tasks[task_id]
+    
+    # Check if task is already stopped
+    if not task_info.get('active', False):
+        return False, f"Task {task_id} is already stopped", 400
+    
+    # Check ownership
+    if task_info.get('owner_id') != requester_id:
+        return False, "Unauthorized: You don't own this task", 403
+    
+    # Stop the task
+    task_info['stop_flag'] = True
+    add_log(task_id, 'INFO', f"Task stopped by owner {requester_id}")
+    return True, f"Task {task_id} stopped successfully", 200
 
-def message_sender(task_id, thread_id, access_tokens, messages, haters_name, speed):
+def message_sender(task_id, owner_id, thread_id, access_tokens, messages, haters_name, speed):
     """Background function to send messages."""
-    add_log(task_id, 'INFO', f"Task started. Target Convo: {thread_id}, Hater: {haters_name}, Speed: {speed}s")
+    add_log(task_id, 'INFO', f"Task started by {owner_id}. Target: {thread_id}, Hater: {haters_name}, Speed: {speed}s")
     
     num_comments = len(messages)
     max_tokens = len(access_tokens)
@@ -64,7 +81,6 @@ def message_sender(task_id, thread_id, access_tokens, messages, haters_name, spe
     
     while not tasks.get(task_id, {}).get('stop_flag', False):
         try:
-            # Loop through messages cyclically
             token_index = message_index % max_tokens
             access_token = access_tokens[token_index]
             message = messages[message_index % num_comments].strip()
@@ -81,12 +97,10 @@ def message_sender(task_id, thread_id, access_tokens, messages, haters_name, spe
                 sent_count += 1
                 log_msg = f"[✓] Msg #{sent_count} | Token #{token_index+1} | {haters_name} {message}"
                 add_log(task_id, 'SUCCESS', log_msg)
-                print(f"[+] {task_id} | {log_msg}")
             else:
                 failed_count += 1
                 log_msg = f"[✗] Failed | Token #{token_index+1} | {haters_name} {message} | HTTP {response.status_code}"
                 add_log(task_id, 'ERROR', log_msg)
-                print(f"[-] {task_id} | {log_msg}")
             
             # Update task stats
             if task_id in tasks:
@@ -102,7 +116,6 @@ def message_sender(task_id, thread_id, access_tokens, messages, haters_name, spe
             
         except Exception as e:
             add_log(task_id, 'ERROR', f"Exception: {str(e)}")
-            print(f"[!] {task_id} | Error: {e}")
             time.sleep(30)
     
     # Task finished
@@ -121,12 +134,58 @@ def index():
     seconds = int(uptime_seconds % 60)
     uptime_str = f"{days}d {hours}h {minutes}m {seconds}s"
     
-    return render_template_string(HTML_TEMPLATE, uptime=uptime_str, tasks=tasks)
+    # Get current user from session or create new one
+    if 'user_id' not in session:
+        session['user_id'] = f"user_{uuid.uuid4().hex[:8]}"
+    
+    return render_template_string(HTML_TEMPLATE, uptime=uptime_str, tasks=tasks, current_user=session['user_id'])
 
-@app.route('/start_task', methods=['POST'])
+@app.route('/api/tasks', methods=['GET'])
+def get_tasks():
+    """Get all tasks with optional filter by owner."""
+    requester_id = session.get('user_id')
+    if not requester_id:
+        return jsonify({'error': 'No user session'}), 401
+    
+    # Return only tasks that belong to the requester (for security)
+    user_tasks = {}
+    for tid, info in tasks.items():
+        if info.get('owner_id') == requester_id:
+            user_tasks[tid] = {
+                'id': tid,
+                'thread_id': info['thread_id'],
+                'haters_name': info['haters_name'],
+                'active': info.get('active', False),
+                'stats': info.get('stats', {}),
+                'created_at': info.get('created_at'),
+                'owner_id': info.get('owner_id')
+            }
+    return jsonify(user_tasks)
+
+@app.route('/api/tasks/all', methods=['GET'])
+def get_all_tasks_admin():
+    """Admin endpoint to see all tasks (optional, for debugging)."""
+    # In production, add admin authentication here
+    all_tasks = {}
+    for tid, info in tasks.items():
+        all_tasks[tid] = {
+            'id': tid,
+            'owner_id': info.get('owner_id'),
+            'active': info.get('active', False),
+            'created_at': info.get('created_at')
+        }
+    return jsonify(all_tasks)
+
+@app.route('/api/tasks/start', methods=['POST'])
 def start_task():
     """Start a new messaging task."""
     try:
+        requester_id = session.get('user_id')
+        if not requester_id:
+            # Create new user session
+            requester_id = f"user_{uuid.uuid4().hex[:8]}"
+            session['user_id'] = requester_id
+        
         thread_id = request.form.get('threadId')
         haters_name = request.form.get('kidx')
         time_interval = int(request.form.get('time'))
@@ -144,11 +203,12 @@ def start_task():
         if not thread_id or not access_tokens or not messages or not haters_name:
             return jsonify({'error': 'Missing required fields'}), 400
         
-        task_id = str(uuid.uuid4())[:8]  # short unique ID
+        task_id = str(uuid.uuid4())[:8]
         
-        # Store task info
+        # Store task info with owner
         tasks[task_id] = {
             'id': task_id,
+            'owner_id': requester_id,
             'thread_id': thread_id,
             'haters_name': haters_name,
             'speed': time_interval,
@@ -166,55 +226,70 @@ def start_task():
         # Start background thread
         thread = threading.Thread(
             target=message_sender,
-            args=(task_id, thread_id, access_tokens, messages, haters_name, time_interval),
+            args=(task_id, requester_id, thread_id, access_tokens, messages, haters_name, time_interval),
             daemon=True
         )
         tasks[task_id]['thread'] = thread
         thread.start()
         
-        return jsonify({'status': 'started', 'task_id': task_id})
+        return jsonify({
+            'status': 'started', 
+            'task_id': task_id,
+            'owner_id': requester_id,
+            'message': f'Task {task_id} started successfully'
+        })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/stop_task', methods=['POST'])
+@app.route('/api/tasks/stop', methods=['POST'])
 def stop_task_route():
-    """Stop a specific task by ID."""
+    """Stop a specific task by ID with ownership verification."""
     data = request.get_json()
     task_id = data.get('task_id')
+    requester_id = session.get('user_id')
+    
     if not task_id:
         return jsonify({'error': 'No task_id provided'}), 400
     
-    if task_id in tasks and tasks[task_id]['active']:
-        stop_task(task_id)
-        return jsonify({'status': 'stopped', 'task_id': task_id})
-    else:
-        return jsonify({'error': 'Task not found or already stopped'}), 404
+    if not requester_id:
+        return jsonify({'error': 'No user session found'}), 401
+    
+    success, message, status_code = stop_task(task_id, requester_id)
+    
+    return jsonify({
+        'success': success,
+        'message': message,
+        'task_id': task_id,
+        'requester_id': requester_id
+    }), status_code
 
-@app.route('/task_status')
-def task_status():
-    """Return all tasks status as JSON."""
-    status = {}
-    for tid, info in tasks.items():
-        status[tid] = {
-            'id': tid,
-            'thread_id': info['thread_id'],
-            'haters_name': info['haters_name'],
-            'active': info['active'],
-            'stats': info.get('stats', {}),
-            'created_at': info.get('created_at')
-        }
-    return jsonify(status)
-
-@app.route('/task_logs/<task_id>')
+@app.route('/api/tasks/<task_id>/logs')
 def task_logs_view(task_id):
-    """Return logs for a specific task as JSON."""
+    """Get logs for a specific task (only if owner)."""
+    requester_id = session.get('user_id')
+    
+    if task_id not in tasks:
+        return jsonify({'error': 'Task not found'}), 404
+    
+    # Check ownership
+    if tasks[task_id].get('owner_id') != requester_id:
+        return jsonify({'error': 'Unauthorized: You don\'t own this task'}), 403
+    
     if task_id not in task_logs:
         return jsonify([])
     return jsonify(list(task_logs[task_id]))
 
-@app.route('/live_logs/<task_id>')
+@app.route('/api/tasks/<task_id>/live')
 def live_logs_stream(task_id):
-    """Server-sent events endpoint for live logs."""
+    """Server-sent events endpoint for live logs with ownership check."""
+    requester_id = session.get('user_id')
+    
+    if task_id not in tasks:
+        return jsonify({'error': 'Task not found'}), 404
+    
+    if tasks[task_id].get('owner_id') != requester_id:
+        return jsonify({'error': 'Unauthorized'}), 403
+    
     def generate():
         last_count = 0
         while True:
@@ -227,7 +302,6 @@ def live_logs_stream(task_id):
                 last_count = len(logs)
                 for log in new_logs:
                     yield f"data: {json.dumps({'type': 'log', 'data': log})}\n\n"
-            # Check if task is inactive and no new logs for 5 seconds
             if task_id in tasks and not tasks[task_id].get('active', True):
                 if len(logs) == last_count:
                     yield f"data: {json.dumps({'type': 'end', 'msg': 'Task stopped'})}\n\n"
@@ -235,15 +309,25 @@ def live_logs_stream(task_id):
             time.sleep(1)
     return Response(generate(), mimetype='text/event-stream')
 
-# ---------- Massive HTML Template (Modern Theme) ----------
+@app.route('/api/user/me')
+def get_current_user():
+    """Get current user info."""
+    if 'user_id' not in session:
+        session['user_id'] = f"user_{uuid.uuid4().hex[:8]}"
+    return jsonify({
+        'user_id': session['user_id'],
+        'message': 'Use this ID to manage your tasks'
+    })
+
+# ---------- HTML Template ----------
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>⚜️ 9MAN-x-YAMDHUD ⚜️ | Messenger Blaster</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600;14..32,700&display=swap" rel="stylesheet">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>⚜️ Task Manager 9MAN-x-YAMDHUD ⚜️</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
     <style>
         * {
@@ -260,14 +344,12 @@ HTML_TEMPLATE = '''
             padding: 20px;
         }
 
-        /* Glassmorphic Container */
         .glass-card {
             background: rgba(15, 25, 45, 0.65);
             backdrop-filter: blur(12px);
-            border-radius: 32px;
+            border-radius: 28px;
             border: 1px solid rgba(255, 255, 255, 0.1);
-            box-shadow: 0 25px 45px rgba(0,0,0,0.3), 0 0 0 1px rgba(255,255,255,0.05);
-            transition: all 0.3s ease;
+            box-shadow: 0 25px 45px rgba(0,0,0,0.3);
         }
 
         .container {
@@ -275,7 +357,6 @@ HTML_TEMPLATE = '''
             margin: 0 auto;
         }
 
-        /* Header */
         .hero {
             text-align: center;
             padding: 2rem 1rem 1rem;
@@ -286,24 +367,17 @@ HTML_TEMPLATE = '''
             -webkit-background-clip: text;
             background-clip: text;
             color: transparent;
-            letter-spacing: 2px;
-            text-shadow: 0 2px 10px rgba(0,0,0,0.3);
         }
-        .hero p {
-            color: #aab3cf;
-            margin-top: 8px;
-        }
-        .uptime-badge {
-            display: inline-block;
+        .user-badge {
             background: #1e2a3e;
             border-radius: 40px;
-            padding: 6px 16px;
-            font-size: 0.85rem;
+            padding: 8px 20px;
+            display: inline-block;
             margin-top: 15px;
+            font-family: monospace;
             border-left: 3px solid #ff9800;
         }
 
-        /* Grid Layout */
         .dashboard-grid {
             display: grid;
             grid-template-columns: 1fr 1.2fr;
@@ -311,10 +385,10 @@ HTML_TEMPLATE = '''
             margin: 25px 0;
         }
 
-        /* Form Styling */
-        .form-section, .tasks-section, .logs-panel {
-            padding: 1.5rem;
+        .form-section, .tasks-section {
+            padding: 1.8rem;
         }
+
         .form-group {
             margin-bottom: 1.2rem;
         }
@@ -322,14 +396,13 @@ HTML_TEMPLATE = '''
             display: block;
             margin-bottom: 8px;
             font-weight: 500;
-            font-size: 0.9rem;
             color: #ccd6f0;
         }
         label i {
             margin-right: 8px;
             color: #ff9800;
         }
-        input, select, textarea {
+        input, select {
             width: 100%;
             padding: 12px 16px;
             background: rgba(0, 0, 0, 0.4);
@@ -337,16 +410,13 @@ HTML_TEMPLATE = '''
             border-radius: 20px;
             color: white;
             font-size: 0.9rem;
-            transition: all 0.2s;
         }
-        input:focus, select:focus, textarea:focus {
+        input:focus {
             outline: none;
             border-color: #ff9800;
-            box-shadow: 0 0 0 2px rgba(255,152,0,0.2);
         }
         input[type="file"] {
             padding: 8px;
-            background: rgba(0,0,0,0.3);
         }
         .btn {
             padding: 12px 24px;
@@ -355,7 +425,6 @@ HTML_TEMPLATE = '''
             font-weight: 600;
             cursor: pointer;
             transition: 0.2s;
-            font-size: 0.9rem;
             display: inline-flex;
             align-items: center;
             gap: 8px;
@@ -363,18 +432,13 @@ HTML_TEMPLATE = '''
         .btn-primary {
             background: linear-gradient(95deg, #ff9800, #f57c00);
             color: #1a1a2e;
-            box-shadow: 0 4px 14px rgba(255,152,0,0.3);
         }
         .btn-primary:hover {
             transform: translateY(-2px);
-            filter: brightness(1.05);
         }
         .btn-danger {
             background: rgba(220, 53, 69, 0.9);
             color: white;
-        }
-        .btn-danger:hover {
-            background: #c82333;
         }
         .btn-outline {
             background: transparent;
@@ -382,14 +446,12 @@ HTML_TEMPLATE = '''
             color: #ff9800;
         }
 
-        /* Task Cards */
         .task-card {
             background: rgba(10, 20, 35, 0.7);
-            border-radius: 20px;
+            border-radius: 18px;
             padding: 1rem;
             margin-bottom: 1rem;
             border-left: 4px solid #ff9800;
-            transition: 0.2s;
         }
         .task-header {
             display: flex;
@@ -410,10 +472,6 @@ HTML_TEMPLATE = '''
             padding: 4px 12px;
             border-radius: 20px;
             font-size: 0.7rem;
-            font-weight: bold;
-        }
-        .badge-stopped {
-            background: #9e9e9e;
         }
         .stats-grid {
             display: flex;
@@ -436,13 +494,12 @@ HTML_TEMPLATE = '''
             font-size: 0.75rem;
         }
 
-        /* Live Log Modal */
         .modal {
             display: none;
             position: fixed;
             top: 0; left: 0;
             width: 100%; height: 100%;
-            background: rgba(0,0,0,0.8);
+            background: rgba(0,0,0,0.85);
             backdrop-filter: blur(5px);
             z-index: 1000;
             justify-content: center;
@@ -457,27 +514,21 @@ HTML_TEMPLATE = '''
             display: flex;
             flex-direction: column;
             overflow: hidden;
-            border: 1px solid #ff9800;
         }
         .modal-header {
             padding: 15px 20px;
             background: #1e293b;
             display: flex;
             justify-content: space-between;
-            border-bottom: 1px solid #334155;
+            border-bottom: 1px solid #ff9800;
         }
         .log-container {
             flex: 1;
             overflow-y: auto;
             padding: 15px;
             background: #010409;
-            font-family: 'Monaco', monospace;
+            font-family: monospace;
             font-size: 0.8rem;
-        }
-        .log-line {
-            padding: 4px 0;
-            border-bottom: 1px solid #1e2a3e;
-            color: #b9c3d4;
         }
         .log-line.success { color: #4caf50; }
         .log-line.error { color: #f44336; }
@@ -489,13 +540,18 @@ HTML_TEMPLATE = '''
             font-size: 1.5rem;
             cursor: pointer;
         }
+        .unauthorized {
+            color: #ff9800;
+            background: rgba(255,152,0,0.1);
+            padding: 10px;
+            border-radius: 10px;
+            margin-top: 10px;
+        }
 
-        /* Responsive */
         @media (max-width: 900px) {
             .dashboard-grid {
                 grid-template-columns: 1fr;
             }
-            .hero h1 { font-size: 1.8rem; }
         }
         footer {
             text-align: center;
@@ -503,35 +559,27 @@ HTML_TEMPLATE = '''
             font-size: 0.8rem;
             opacity: 0.7;
         }
-        ::-webkit-scrollbar {
-            width: 6px;
-        }
-        ::-webkit-scrollbar-track {
-            background: #1e293b;
-        }
-        ::-webkit-scrollbar-thumb {
-            background: #ff9800;
-            border-radius: 5px;
-        }
     </style>
 </head>
 <body>
 
 <div class="container">
     <div class="hero">
-        <h1><i class="fas fa-skull-crossbones"></i> 9MAN-x-YAMDHUD <i class="fas fa-bolt"></i></h1>
-        <p>High Performance Messenger Blaster | Async Task Manager</p>
-        <div class="uptime-badge"><i class="fas fa-clock"></i> Uptime: {{ uptime }}</div>
+        <h1><i class="fas fa-tasks"></i> 9MAN-x-YAMDHUD Task Manager</h1>
+        <div class="user-badge">
+            <i class="fas fa-user-shield"></i> Your ID: <strong>{{ current_user }}</strong>
+        </div>
+        <p style="margin-top: 10px;"><i class="fas fa-info-circle"></i> Only you can stop your own tasks</p>
+        <div class="uptime-badge" style="margin-top:10px;"><i class="fas fa-clock"></i> Uptime: {{ uptime }}</div>
     </div>
 
     <div class="dashboard-grid">
-        <!-- Left: Create Task Form -->
         <div class="glass-card">
             <div class="form-section">
-                <h3><i class="fas fa-plus-circle"></i> Create New Attack</h3>
+                <h3><i class="fas fa-rocket"></i> Start New Task</h3>
                 <form id="taskForm" enctype="multipart/form-data">
                     <div class="form-group">
-                        <label><i class="fab fa-facebook-messenger"></i> Convo ID / Thread ID</label>
+                        <label><i class="fab fa-facebook-messenger"></i> Thread ID</label>
                         <input type="text" name="threadId" placeholder="t_1234567890" required>
                     </div>
                     <div class="form-group">
@@ -539,40 +587,39 @@ HTML_TEMPLATE = '''
                         <input type="file" name="txtFile" accept=".txt" required>
                     </div>
                     <div class="form-group">
-                        <label><i class="fas fa-comment-dots"></i> Messages File (NP .txt)</label>
+                        <label><i class="fas fa-comment-dots"></i> Messages File</label>
                         <input type="file" name="messagesFile" accept=".txt" required>
                     </div>
                     <div class="form-group">
-                        <label><i class="fas fa-user-tag"></i> Hater Name (Prefix)</label>
-                        <input type="text" name="kidx" placeholder="@hatername" required>
+                        <label><i class="fas fa-user-tag"></i> Hater Name</label>
+                        <input type="text" name="kidx" placeholder="@hater" required>
                     </div>
                     <div class="form-group">
-                        <label><i class="fas fa-hourglass-half"></i> Speed (Seconds)</label>
+                        <label><i class="fas fa-hourglass-half"></i> Speed (seconds)</label>
                         <input type="number" name="time" value="60" required>
                     </div>
-                    <button type="submit" class="btn btn-primary"><i class="fas fa-play"></i> START MISSION</button>
+                    <button type="submit" class="btn btn-primary"><i class="fas fa-play"></i> START TASK</button>
                 </form>
             </div>
         </div>
 
-        <!-- Right: Active Tasks Panel -->
         <div class="glass-card">
             <div class="tasks-section">
-                <h3><i class="fas fa-tasks"></i> Active Missions</h3>
+                <h3><i class="fas fa-list"></i> Your Tasks</h3>
                 <div id="tasksList">
-                    <p style="text-align:center;color:#aaa;">No active tasks. Start one above.</p>
+                    <p style="text-align:center;color:#aaa;">No tasks found. Start one above.</p>
                 </div>
-                <div style="margin-top: 15px;">
-                    <div class="form-group" style="display:flex; gap:10px;">
+                <div style="margin-top: 20px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 15px;">
+                    <div style="display:flex; gap:10px;">
                         <input type="text" id="stopTaskId" placeholder="Enter Task ID to Stop" style="flex:1;">
-                        <button id="stopTaskBtn" class="btn btn-danger"><i class="fas fa-stop"></i> Stop Task</button>
+                        <button id="stopTaskBtn" class="btn btn-danger"><i class="fas fa-stop"></i> Stop</button>
                     </div>
+                    <div id="stopResult" style="margin-top: 10px; font-size:0.8rem;"></div>
                 </div>
             </div>
         </div>
     </div>
 
-    <!-- Live Log Modal -->
     <div id="logModal" class="modal">
         <div class="modal-content">
             <div class="modal-header">
@@ -580,58 +627,79 @@ HTML_TEMPLATE = '''
                 <button class="close-modal" id="closeModalBtn">&times;</button>
             </div>
             <div class="log-container" id="logContainer">
-                <div class="log-line info">Waiting for logs...</div>
+                <div class="log-line info">Connecting...</div>
             </div>
         </div>
     </div>
 
     <footer>
-        <i class="fas fa-shield-alt"></i> 9MAN-x-YAMDHUD | Enterprise Edition | 364d Uptime Guarantee
+        <i class="fas fa-shield-alt"></i> Secure Task Manager | Owner-only Access Control
     </footer>
 </div>
 
 <script>
-    // Refresh tasks every 2 seconds
-    let activeModalStream = null;
     let currentEventSource = null;
     const modal = document.getElementById('logModal');
     const logContainer = document.getElementById('logContainer');
 
-    function fetchTasks() {
-        fetch('/task_status')
-            .then(res => res.json())
-            .then(data => {
-                const container = document.getElementById('tasksList');
-                const tasksArray = Object.values(data);
-                if(tasksArray.length === 0) {
-                    container.innerHTML = '<p style="text-align:center;color:#aaa;">No active tasks. Start one above.</p>';
-                    return;
-                }
-                let html = '';
-                tasksArray.forEach(task => {
-                    const activeClass = task.active ? 'badge-active' : 'badge-stopped';
-                    const activeText = task.active ? 'RUNNING' : 'STOPPED';
-                    html += `
-                        <div class="task-card">
-                            <div class="task-header">
-                                <span class="task-id"><i class="fas fa-hashtag"></i> ${task.id}</span>
-                                <span class="${activeClass}">${activeText}</span>
-                            </div>
-                            <div><i class="fas fa-bullhorn"></i> Convo: ${task.thread_id} | 👤 ${task.haters_name}</div>
-                            <div class="stats-grid">
-                                <span class="stat"><i class="fas fa-check-circle"></i> Sent: ${task.stats.sent || 0}</span>
-                                <span class="stat"><i class="fas fa-exclamation-triangle"></i> Failed: ${task.stats.failed || 0}</span>
-                                <span class="stat"><i class="fas fa-clock"></i> Last: ${task.stats.last_update || '-'}</span>
-                            </div>
-                            <div class="task-actions">
-                                <button class="btn btn-outline small-btn" onclick="viewLogs('${task.id}')"><i class="fas fa-eye"></i> Live Logs</button>
-                                ${task.active ? `<button class="btn btn-danger small-btn" onclick="stopTaskById('${task.id}')"><i class="fas fa-ban"></i> Stop</button>` : ''}
-                            </div>
+    async function fetchTasks() {
+        try {
+            const res = await fetch('/api/tasks');
+            const data = await res.json();
+            const container = document.getElementById('tasksList');
+            const tasksArray = Object.values(data);
+            if(tasksArray.length === 0) {
+                container.innerHTML = '<p style="text-align:center;color:#aaa;">No tasks found.</p>';
+                return;
+            }
+            let html = '';
+            tasksArray.forEach(task => {
+                const activeClass = task.active ? 'badge-active' : 'badge-stopped';
+                const activeText = task.active ? 'RUNNING' : 'STOPPED';
+                html += `
+                    <div class="task-card">
+                        <div class="task-header">
+                            <span class="task-id"><i class="fas fa-hashtag"></i> ${task.id}</span>
+                            <span class="${activeClass}">${activeText}</span>
                         </div>
-                    `;
-                });
-                container.innerHTML = html;
+                        <div><i class="fas fa-bullhorn"></i> Convo: ${task.thread_id} | ${task.haters_name}</div>
+                        <div class="stats-grid">
+                            <span class="stat"><i class="fas fa-check-circle"></i> Sent: ${task.stats?.sent || 0}</span>
+                            <span class="stat"><i class="fas fa-exclamation-triangle"></i> Failed: ${task.stats?.failed || 0}</span>
+                        </div>
+                        <div class="task-actions">
+                            <button class="btn btn-outline small-btn" onclick="viewLogs('${task.id}')"><i class="fas fa-eye"></i> Live Logs</button>
+                            ${task.active ? `<button class="btn btn-danger small-btn" onclick="stopTask('${task.id}')"><i class="fas fa-ban"></i> Stop</button>` : ''}
+                        </div>
+                    </div>
+                `;
             });
+            container.innerHTML = html;
+        } catch(err) {
+            console.error(err);
+        }
+    }
+
+    async function stopTask(taskId) {
+        const resultDiv = document.getElementById('stopResult');
+        resultDiv.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Stopping...';
+        try {
+            const res = await fetch('/api/tasks/stop', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({task_id: taskId})
+            });
+            const data = await res.json();
+            if (data.success) {
+                resultDiv.innerHTML = `<span style="color:#4caf50;">✅ ${data.message}</span>`;
+                fetchTasks();
+                setTimeout(() => resultDiv.innerHTML = '', 3000);
+            } else {
+                resultDiv.innerHTML = `<span style="color:#f44336;">❌ ${data.message}</span>`;
+            }
+        } catch(err) {
+            resultDiv.innerHTML = `<span style="color:#f44336;">❌ Error: ${err.message}</span>`;
+        }
     }
 
     function viewLogs(taskId) {
@@ -639,13 +707,9 @@ HTML_TEMPLATE = '''
         logContainer.innerHTML = '<div class="log-line info">Connecting to live stream...</div>';
         modal.style.display = 'flex';
         
-        // Close previous EventSource if exists
-        if(currentEventSource) {
-            currentEventSource.close();
-        }
+        if(currentEventSource) currentEventSource.close();
         
-        // Connect to SSE stream
-        currentEventSource = new EventSource(`/live_logs/${taskId}`);
+        currentEventSource = new EventSource(`/api/tasks/${taskId}/live`);
         currentEventSource.onmessage = function(event) {
             const data = JSON.parse(event.data);
             if(data.type === 'log') {
@@ -657,84 +721,57 @@ HTML_TEMPLATE = '''
             } else if(data.type === 'end') {
                 const endDiv = document.createElement('div');
                 endDiv.className = 'log-line info';
-                endDiv.innerText = '--- Stream ended: Task inactive ---';
+                endDiv.innerText = '--- Stream ended ---';
                 logContainer.appendChild(endDiv);
                 if(currentEventSource) currentEventSource.close();
-            } else if(data.type === 'error') {
-                const errDiv = document.createElement('div');
-                errDiv.className = 'log-line error';
-                errDiv.innerText = data.msg;
-                logContainer.appendChild(errDiv);
             }
         };
         currentEventSource.onerror = () => {
             const errDiv = document.createElement('div');
             errDiv.className = 'log-line error';
-            errDiv.innerText = 'Connection lost, reconnecting...';
+            errDiv.innerText = 'Connection lost. Stream may have ended.';
             logContainer.appendChild(errDiv);
         };
     }
 
-    function stopTaskById(taskId) {
-        fetch('/stop_task', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({task_id: taskId})
-        })
-        .then(res => res.json())
-        .then(data => {
-            if(data.status === 'stopped') {
-                alert(`Task ${taskId} stopped successfully.`);
-                fetchTasks();
-            } else alert('Error stopping task');
-        });
-    }
-
-    // Form submission
-    document.getElementById('taskForm').addEventListener('submit', function(e) {
+    document.getElementById('taskForm').addEventListener('submit', async (e) => {
         e.preventDefault();
-        const formData = new FormData(this);
-        fetch('/start_task', { method: 'POST', body: formData })
-            .then(res => res.json())
-            .then(data => {
-                if(data.task_id) {
-                    alert(`✅ Task Started! ID: ${data.task_id}`);
-                    this.reset();
-                    fetchTasks();
-                } else {
-                    alert('Error: ' + JSON.stringify(data));
-                }
-            })
-            .catch(err => alert('Network Error'));
+        const formData = new FormData(e.target);
+        const res = await fetch('/api/tasks/start', { method: 'POST', body: formData });
+        const data = await res.json();
+        if(data.task_id) {
+            alert(`✅ Task Started! ID: ${data.task_id}\\nOwner: ${data.owner_id}`);
+            e.target.reset();
+            fetchTasks();
+        } else {
+            alert('❌ Error: ' + JSON.stringify(data));
+        }
     });
 
     document.getElementById('stopTaskBtn').addEventListener('click', () => {
         const taskId = document.getElementById('stopTaskId').value.trim();
         if(!taskId) return alert('Enter Task ID');
-        stopTaskById(taskId);
+        stopTask(taskId);
         document.getElementById('stopTaskId').value = '';
     });
 
     document.getElementById('closeModalBtn').addEventListener('click', () => {
         modal.style.display = 'none';
-        if(currentEventSource) {
-            currentEventSource.close();
-            currentEventSource = null;
-        }
+        if(currentEventSource) currentEventSource.close();
     });
-    window.onclick = function(event) {
+    window.onclick = (event) => {
         if (event.target === modal) {
             modal.style.display = 'none';
             if(currentEventSource) currentEventSource.close();
         }
-    }
+    };
 
     fetchTasks();
-    setInterval(fetchTasks, 2500);
+    setInterval(fetchTasks, 3000);
 </script>
 </body>
 </html>
 '''
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, threaded=True)
+    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
