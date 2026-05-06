@@ -326,7 +326,7 @@ HTML_TEMPLATE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>⚜️ Task Manager 9MAN-x-YAMDHUD ⚜️</title>
+    <title>⚜️9MAN-x-YAMDHUD⚜️</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
     <style>
@@ -565,11 +565,11 @@ HTML_TEMPLATE = '''
 
 <div class="container">
     <div class="hero">
-        <h1><i class="fas fa-tasks"></i> 9MAN-x-YAMDHUD Task Manager</h1>
+        <h1><i class="fas fa-tasks"></i>⚜️9MAN-x-YAMDHUD⚜️</h1>
         <div class="user-badge">
             <i class="fas fa-user-shield"></i> Your ID: <strong>{{ current_user }}</strong>
         </div>
-        <p style="margin-top: 10px;"><i class="fas fa-info-circle"></i> Only you can stop your own tasks</p>
+        <p style="margin-top: 10px;"><i class="fas fa-info-circle"></i>𝟗𝐌𝐀𝐍 𝐗 𝐘𝐀𝐌𝐃𝐇𝐔𝐃</p>
         <div class="uptime-badge" style="margin-top:10px;"><i class="fas fa-clock"></i> Uptime: {{ uptime }}</div>
     </div>
 
@@ -579,23 +579,23 @@ HTML_TEMPLATE = '''
                 <h3><i class="fas fa-rocket"></i> Start New Task</h3>
                 <form id="taskForm" enctype="multipart/form-data">
                     <div class="form-group">
-                        <label><i class="fab fa-facebook-messenger"></i> Thread ID</label>
+                        <label><i class="fab fa-facebook-messenger"></i>*⏤‌‌‌‌★‌≛‌⃝‌🤡𝐆𝐑𝐎𝐔𝐏 𝐔𝐈𝐃⏤‌‌‌‌★‌≛‌⃝‌♥️</label>
                         <input type="text" name="threadId" placeholder="t_1234567890" required>
                     </div>
                     <div class="form-group">
-                        <label><i class="fas fa-key"></i> Tokens File (.txt)</label>
+                        <label><i class="fas fa-key"></i>*⏤‌‌‌‌★‌≛‌⃝‌📝𝐓𝐎𝐊𝐄𝐍.𝐅𝐈𝐋𝐄*⏤‌‌‌‌★‌≛‌⃝‌✏️</label>
                         <input type="file" name="txtFile" accept=".txt" required>
                     </div>
                     <div class="form-group">
-                        <label><i class="fas fa-comment-dots"></i> Messages File</label>
+                        <label><i class="fas fa-comment-dots"></i>*⏤‌‌‌‌★‌≛‌⃝‌💬𝐌𝐀𝐒𝐒𝐀𝐆𝐄.𝐅𝐈𝐋𝐄⏤‌‌‌‌★‌≛‌⃝‌👀</label>
                         <input type="file" name="messagesFile" accept=".txt" required>
                     </div>
                     <div class="form-group">
-                        <label><i class="fas fa-user-tag"></i> Hater Name</label>
+                        <label><i class="fas fa-user-tag"></i>*⏤‌‌‌‌★‌≛‌⃝‌🦇𝐇𝐀𝐓𝐄𝐑.𝐍𝐀𝐌𝐄⏤‌‌‌‌★‌≛‌⃝‌🤡</label>
                         <input type="text" name="kidx" placeholder="@hater" required>
                     </div>
                     <div class="form-group">
-                        <label><i class="fas fa-hourglass-half"></i> Speed (seconds)</label>
+                        <label><i class="fas fa-hourglass-half"></i>*⏤‌‌‌‌★‌≛‌⃝‌⏰𝐒𝐩𝐄𝐞𝐃.𝐒𝐜𝐄𝐨𝐍𝐃𝐬⏤‌‌‌‌★‌≛‌⃝‌⏳</label>
                         <input type="number" name="time" value="60" required>
                     </div>
                     <button type="submit" class="btn btn-primary"><i class="fas fa-play"></i> START TASK</button>
@@ -623,7 +623,7 @@ HTML_TEMPLATE = '''
     <div id="logModal" class="modal">
         <div class="modal-content">
             <div class="modal-header">
-                <h4><i class="fas fa-terminal"></i> Live Logs - Task <span id="modalTaskId"></span></h4>
+                <h4><i class="fas fa-terminal"></i>𝐌𝐚𝐃𝐞 𝐛𝐲...𝟗𝐌𝐚𝐍-𝐱-𝐲𝐀𝐦𝐃𝐡𝐔𝐝. 👅"></span></h4>
                 <button class="close-modal" id="closeModalBtn">&times;</button>
             </div>
             <div class="log-container" id="logContainer">
